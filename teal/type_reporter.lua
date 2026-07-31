@@ -90,6 +90,7 @@ local type_reporter = { TypeCollector = { Symbol = {} }, TypeInfo = {}, TypeRepo
 
 
 
+
 local TypeReport = type_reporter.TypeReport
 local TypeReporter = type_reporter.TypeReporter
 
@@ -134,6 +135,7 @@ local typecodes = {
    UNKNOWN = 0x80008000,
    INVALID = 0x80000000,
 }
+type_reporter.typecodes = typecodes
 
 
 
@@ -503,6 +505,28 @@ end
 
 function TypeReporter:get_report()
    return self.tr
+end
+
+function TypeReporter:remove_files(filenames)
+   local removed_symbols = false
+   for _, filename in ipairs(filenames) do
+      self.tr.by_pos[filename] = nil
+      if self.tr.symbols == self.tr.symbols_by_file[filename] then
+         removed_symbols = true
+      end
+      self.tr.symbols_by_file[filename] = nil
+   end
+   if removed_symbols then
+      self.tr.symbols = nil
+      local remaining = {}
+      for filename in pairs(self.tr.symbols_by_file) do
+         table.insert(remaining, filename)
+      end
+      table.sort(remaining)
+      if remaining[1] then
+         self.tr.symbols = self.tr.symbols_by_file[remaining[1]]
+      end
+   end
 end
 
 

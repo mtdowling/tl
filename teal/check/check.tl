@@ -102,6 +102,7 @@ end
 function check.check(ast: Node, env: Env, filename: string): Result
    assert(filename)
 
+   local previous_globals = shallow_copy_table(env.globals)
    local self = Context.new(env, filename)
 
    local visit_node, visit_type = visit_node, visit_type
@@ -132,6 +133,18 @@ function check.check(ast: Node, env: Env, filename: string): Result
 
    errors.clear_redundant_errors(self.errs.errors)
 
+   local global_previous: {string:(variables.Variable|boolean)} = {}
+   for name, variable in pairs(env.globals) do
+      if previous_globals[name] ~= variable then
+         global_previous[name] = previous_globals[name] or false
+      end
+   end
+   for name, variable in pairs(previous_globals) do
+      if env.globals[name] == nil then
+         global_previous[name] = variable
+      end
+   end
+
    local result = {
       ast = ast,
       env = env,
@@ -140,6 +153,7 @@ function check.check(ast: Node, env: Env, filename: string): Result
       warnings = self.errs.warnings,
       type_errors = self.errs.errors,
       dependencies = self.dependencies,
+      global_previous = global_previous,
       needs_compat = self.needs_compat,
    }
 

@@ -1,4 +1,4 @@
-local _tl_compat; if (tonumber((_VERSION or ''):match('[%d.]*$')) or 0) < 5.3 then local p, m = pcall(require, 'compat53.module'); if p then _tl_compat = m end end; local pairs = _tl_compat and _tl_compat.pairs or pairs; local string = _tl_compat and _tl_compat.string or string; local table = _tl_compat and _tl_compat.table or table
+local _tl_compat; if (tonumber((_VERSION or ''):match('[%d.]*$')) or 0) < 5.3 then local p, m = pcall(require, 'compat53.module'); if p then _tl_compat = m end end; local io = _tl_compat and _tl_compat.io or io; local pairs = _tl_compat and _tl_compat.pairs or pairs; local string = _tl_compat and _tl_compat.string or string; local table = _tl_compat and _tl_compat.table or table
 local VERSION = "0.25.0-alpha+dev"
 
 local tldebug = require("teal.debug")
@@ -30,7 +30,14 @@ local a_type = types.a_type
 
 
 
+
+
+
 local environment = { EnvOptions = {}, Env = {}, Result = {} }
+
+
+
+
 
 
 
@@ -97,9 +104,14 @@ environment.DEFAULT_GEN_TARGET = "5.3"
 
 
 local require_module
+local resolve_module
 
 function environment.set_require_module_fn(fn)
    require_module = fn
+end
+
+function environment.set_resolve_module_fn(fn)
+   resolve_module = fn
 end
 
 local function empty_environment()
@@ -111,7 +123,25 @@ local function empty_environment()
       globals = {},
       opts = {},
       require_module = require_module,
+      resolve_module = resolve_module,
    }
+end
+
+local function read_file(filename)
+   local fd, open_err = io.open(filename, "rb")
+   if not fd then
+      return nil, open_err
+   end
+   local source, read_err = fd:read("*a")
+   fd:close()
+   return source, read_err
+end
+
+function environment.read_source(env, filename)
+   if env.session then
+      return env.session:read_source(filename)
+   end
+   return read_file(filename)
 end
 
 local function declare_globals(env)
@@ -287,9 +317,15 @@ function environment.load_module(env, name)
 end
 
 function environment.register(env, filename, result)
+   if env.session then
+      filename = env.session:normalize_filename(filename)
+   end
    env.loaded[filename] = result
 
    table.insert(env.loaded_order, filename)
+   if env.session then
+      env.session:record_result(filename, result.dependencies)
+   end
 end
 
 function environment.register_failed(env, filename, syntax_errors)
@@ -299,10 +335,10 @@ function environment.register_failed(env, filename, syntax_errors)
       type_errors = {},
       syntax_errors = syntax_errors,
       dependencies = {},
+      global_previous = {},
       env = env,
    }
-   env.loaded[filename] = result
-   table.insert(env.loaded_order, filename)
+   environment.register(env, filename, result)
    return result
 end
 

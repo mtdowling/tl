@@ -77,6 +77,7 @@ local v2 = { CheckOptions = {}, EnvOptions = {} }
 
 
 environment.set_require_module_fn(require_file.require_module)
+environment.set_resolve_module_fn(require_file.resolve_module)
 
 v2.warning_kinds = errors.warning_kinds
 v2.typecodes = type_reporter.typecodes
@@ -2943,7 +2944,7 @@ end
 
 -- module teal.check.check from teal/check/check.lua
 package.preload["teal.check.check"] = function(...)
-local _tl_compat; if (tonumber((_VERSION or ''):match('[%d.]*$')) or 0) < 5.3 then local p, m = pcall(require, 'compat53.module'); if p then _tl_compat = m end end; local assert = _tl_compat and _tl_compat.assert or assert; local context = require("teal.check.context")
+local _tl_compat; if (tonumber((_VERSION or ''):match('[%d.]*$')) or 0) < 5.3 then local p, m = pcall(require, 'compat53.module'); if p then _tl_compat = m end end; local assert = _tl_compat and _tl_compat.assert or assert; local pairs = _tl_compat and _tl_compat.pairs or pairs; local context = require("teal.check.context")
 local Context = context.Context
 
 local tldebug = require("teal.debug")
@@ -3047,6 +3048,7 @@ end
 function check.check(ast, env, filename)
    assert(filename)
 
+   local previous_globals = shallow_copy_table(env.globals)
    local self = Context.new(env, filename)
 
    local visit_node, visit_type = visit_node, visit_type
@@ -3077,6 +3079,18 @@ function check.check(ast, env, filename)
 
    errors.clear_redundant_errors(self.errs.errors)
 
+   local global_previous = {}
+   for name, variable in pairs(env.globals) do
+      if previous_globals[name] ~= variable then
+         global_previous[name] = previous_globals[name] or false
+      end
+   end
+   for name, variable in pairs(previous_globals) do
+      if env.globals[name] == nil then
+         global_previous[name] = variable
+      end
+   end
+
    local result = {
       ast = ast,
       env = env,
@@ -3085,6 +3099,7 @@ function check.check(ast, env, filename)
       warnings = self.errs.warnings,
       type_errors = self.errs.errors,
       dependencies = self.dependencies,
+      global_previous = global_previous,
       needs_compat = self.needs_compat,
    }
 
@@ -6645,11 +6660,12 @@ local types = require("teal.types")
 
 local a_type = types.a_type
 
-
+local environment = require("teal.environment")
 
 
 
 local require_file = {}
+
 
 
 
@@ -6667,7 +6683,23 @@ require_file.all_extensions = {
    [".lua"] = true,
 }
 
-local function search_for(module_name, suffix, path, tried)
+local function read_file(filename)
+   local fd, open_err = io.open(filename, "rb")
+   if not fd then
+      return nil, open_err
+   end
+   local source, read_err = fd:read("*a")
+   fd:close()
+   return source, read_err
+end
+
+local function search_for(
+   module_name,
+   suffix,
+   path,
+   tried,
+   read_source)
+
    for entry in path:gmatch("[^;]+") do
       local slash_name = module_name:gsub("%.", "/")
 
@@ -6675,24 +6707,19 @@ local function search_for(module_name, suffix, path, tried)
       if not entry:match("%?[/\\]init%.lua$") then
          local filename = entry:gsub("?", slash_name)
          local tl_filename = filename:gsub("%.lua$", suffix)
-         local fd = io.open(tl_filename, "rb")
-         if not fd then
+         local code = read_source(tl_filename)
+         if not code then
             table.insert(tried, "no file '" .. tl_filename .. "'")
 
 
             tl_filename = filename:gsub("%.lua$", "/init" .. suffix)
-            fd = io.open(tl_filename, "rb")
-            if not fd then
+            code = read_source(tl_filename)
+            if not code then
                table.insert(tried, "no file '" .. tl_filename .. "'")
             end
          end
 
-         if fd then
-            local code = fd:read("*a")
-            if not code then
-               return nil, nil, tried
-            end
-            fd:close()
+         if code then
             return tl_filename, code, tried
          end
       end
@@ -6700,26 +6727,34 @@ local function search_for(module_name, suffix, path, tried)
    return nil, nil, tried
 end
 
-function require_file.search_module(module_name, extension_set)
+function require_file.search_module(
+   module_name,
+   extension_set,
+   read_source)
+
    local found
    local code
    local tried = {}
    local path = os.getenv("TL_PATH") or package.path
+   read_source = read_source or read_file
 
    if extension_set and extension_set[".d.tl"] then
-      found, code, tried = search_for(module_name, ".d.tl", path, tried)
+      found, code, tried =
+      search_for(module_name, ".d.tl", path, tried, read_source)
       if found then
          return found, code
       end
    end
    if (not extension_set) or extension_set[".tl"] then
-      found, code, tried = search_for(module_name, ".tl", path, tried)
+      found, code, tried =
+      search_for(module_name, ".tl", path, tried, read_source)
       if found then
          return found, code
       end
    end
    if extension_set and extension_set[".lua"] then
-      found, code, tried = search_for(module_name, ".lua", path, tried)
+      found, code, tried =
+      search_for(module_name, ".lua", path, tried, read_source)
       if found then
          return found, code
       end
@@ -6732,12 +6767,24 @@ local function a_circular_require(w)
 end
 
 function require_file.search_and_load(env, module_name, extension_set)
-   local found, code, tried = require_file.search_module(module_name, extension_set)
+   local function read_source(filename)
+      return environment.read_source(env, filename)
+   end
+   local found, code, tried =
+   require_file.search_module(module_name, extension_set, read_source)
    if not found then
       return nil, nil, tried
    end
 
-   env.module_filenames[module_name] = found
+   local cached = env.session and
+   env.session:restore_checked(found, module_name, code)
+   if cached then
+      return cached, found
+   end
+
+   env.module_filenames[module_name] = env.session and
+   env.session:normalize_filename(found) or
+   found
 
    local w = { f = found, x = 1, y = 1 }
    env.modules[module_name] = a_circular_require(w)
@@ -6747,9 +6794,28 @@ function require_file.search_and_load(env, module_name, extension_set)
       return nil, nil, tried
    end
 
-   env.modules[module_name] = found_result.type
+   if env.session then
+      env.session:bind_module(found, module_name, found_result)
+   else
+      env.modules[module_name] = found_result.type
+   end
 
    return found_result, found
+end
+
+function require_file.resolve_module(
+   env,
+   module_name)
+
+   local function read_source(filename)
+      return environment.read_source(env, filename)
+   end
+   local filename, source = require_file.search_module(
+   module_name,
+   require_file.all_extensions,
+   read_source)
+
+   return filename, source
 end
 
 function require_file.require_module(env, module_name)
@@ -10362,7 +10428,7 @@ end
 
 -- module teal.environment from teal/environment.lua
 package.preload["teal.environment"] = function(...)
-local _tl_compat; if (tonumber((_VERSION or ''):match('[%d.]*$')) or 0) < 5.3 then local p, m = pcall(require, 'compat53.module'); if p then _tl_compat = m end end; local pairs = _tl_compat and _tl_compat.pairs or pairs; local string = _tl_compat and _tl_compat.string or string; local table = _tl_compat and _tl_compat.table or table
+local _tl_compat; if (tonumber((_VERSION or ''):match('[%d.]*$')) or 0) < 5.3 then local p, m = pcall(require, 'compat53.module'); if p then _tl_compat = m end end; local io = _tl_compat and _tl_compat.io or io; local pairs = _tl_compat and _tl_compat.pairs or pairs; local string = _tl_compat and _tl_compat.string or string; local table = _tl_compat and _tl_compat.table or table
 local VERSION = "0.25.0-alpha+dev"
 
 local tldebug = require("teal.debug")
@@ -10394,7 +10460,14 @@ local a_type = types.a_type
 
 
 
+
+
+
 local environment = { EnvOptions = {}, Env = {}, Result = {} }
+
+
+
+
 
 
 
@@ -10461,9 +10534,14 @@ environment.DEFAULT_GEN_TARGET = "5.3"
 
 
 local require_module
+local resolve_module
 
 function environment.set_require_module_fn(fn)
    require_module = fn
+end
+
+function environment.set_resolve_module_fn(fn)
+   resolve_module = fn
 end
 
 local function empty_environment()
@@ -10475,7 +10553,25 @@ local function empty_environment()
       globals = {},
       opts = {},
       require_module = require_module,
+      resolve_module = resolve_module,
    }
+end
+
+local function read_file(filename)
+   local fd, open_err = io.open(filename, "rb")
+   if not fd then
+      return nil, open_err
+   end
+   local source, read_err = fd:read("*a")
+   fd:close()
+   return source, read_err
+end
+
+function environment.read_source(env, filename)
+   if env.session then
+      return env.session:read_source(filename)
+   end
+   return read_file(filename)
 end
 
 local function declare_globals(env)
@@ -10651,9 +10747,15 @@ function environment.load_module(env, name)
 end
 
 function environment.register(env, filename, result)
+   if env.session then
+      filename = env.session:normalize_filename(filename)
+   end
    env.loaded[filename] = result
 
    table.insert(env.loaded_order, filename)
+   if env.session then
+      env.session:record_result(filename, result.dependencies)
+   end
 end
 
 function environment.register_failed(env, filename, syntax_errors)
@@ -10663,10 +10765,10 @@ function environment.register_failed(env, filename, syntax_errors)
       type_errors = {},
       syntax_errors = syntax_errors,
       dependencies = {},
+      global_previous = {},
       env = env,
    }
-   env.loaded[filename] = result
-   table.insert(env.loaded_order, filename)
+   environment.register(env, filename, result)
    return result
 end
 
@@ -12480,6 +12582,9 @@ local check = require("teal.check.check")
 local parser = require("teal.parser")
 
 
+
+
+
 local environment = require("teal.environment")
 
 
@@ -12488,11 +12593,30 @@ local input = {}
 
 
 function input.check(env, filename, code)
-   if env.loaded and env.loaded[filename] then
-      return env.loaded[filename]
+   local loaded_filename = filename
+   if env.session then
+      loaded_filename = env.session:normalize_filename(filename)
+   end
+   if env.loaded and env.loaded[loaded_filename] then
+      return env.loaded[loaded_filename]
    end
 
-   local program, syntax_errors = parser.parse(code, filename)
+   local program
+   local syntax_errors
+   local function parse_source()
+      local ast, errs, required = parser.parse(code, filename)
+      return ast, errs, required
+   end
+   if env.session then
+      program, syntax_errors = env.session:parse(
+      filename,
+      code,
+      "reader",
+      parse_source)
+
+   else
+      program, syntax_errors = parse_source()
+   end
 
    if (not env.keep_going) and #syntax_errors > 0 then
       return environment.register_failed(env, filename, syntax_errors)
@@ -18001,6 +18125,7 @@ local type_reporter = { TypeCollector = { Symbol = {} }, TypeInfo = {}, TypeRepo
 
 
 
+
 local TypeReport = type_reporter.TypeReport
 local TypeReporter = type_reporter.TypeReporter
 
@@ -18045,6 +18170,7 @@ local typecodes = {
    UNKNOWN = 0x80008000,
    INVALID = 0x80000000,
 }
+type_reporter.typecodes = typecodes
 
 
 
@@ -18414,6 +18540,28 @@ end
 
 function TypeReporter:get_report()
    return self.tr
+end
+
+function TypeReporter:remove_files(filenames)
+   local removed_symbols = false
+   for _, filename in ipairs(filenames) do
+      self.tr.by_pos[filename] = nil
+      if self.tr.symbols == self.tr.symbols_by_file[filename] then
+         removed_symbols = true
+      end
+      self.tr.symbols_by_file[filename] = nil
+   end
+   if removed_symbols then
+      self.tr.symbols = nil
+      local remaining = {}
+      for filename in pairs(self.tr.symbols_by_file) do
+         table.insert(remaining, filename)
+      end
+      table.sort(remaining)
+      if remaining[1] then
+         self.tr.symbols = self.tr.symbols_by_file[remaining[1]]
+      end
+   end
 end
 
 

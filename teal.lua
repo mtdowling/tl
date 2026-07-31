@@ -2683,7 +2683,7 @@ end
 
 -- module teal.check.check from teal/check/check.lua
 package.preload["teal.check.check"] = function(...)
-local _tl_compat; if (tonumber((_VERSION or ''):match('[%d.]*$')) or 0) < 5.3 then local p, m = pcall(require, 'compat53.module'); if p then _tl_compat = m end end; local assert = _tl_compat and _tl_compat.assert or assert; local context = require("teal.check.context")
+local _tl_compat; if (tonumber((_VERSION or ''):match('[%d.]*$')) or 0) < 5.3 then local p, m = pcall(require, 'compat53.module'); if p then _tl_compat = m end end; local assert = _tl_compat and _tl_compat.assert or assert; local pairs = _tl_compat and _tl_compat.pairs or pairs; local context = require("teal.check.context")
 local Context = context.Context
 
 local tldebug = require("teal.debug")
@@ -2787,6 +2787,7 @@ end
 function check.check(ast, env, filename)
    assert(filename)
 
+   local previous_globals = shallow_copy_table(env.globals)
    local self = Context.new(env, filename)
 
    local visit_node, visit_type = visit_node, visit_type
@@ -2817,6 +2818,18 @@ function check.check(ast, env, filename)
 
    errors.clear_redundant_errors(self.errs.errors)
 
+   local global_previous = {}
+   for name, variable in pairs(env.globals) do
+      if previous_globals[name] ~= variable then
+         global_previous[name] = previous_globals[name] or false
+      end
+   end
+   for name, variable in pairs(previous_globals) do
+      if env.globals[name] == nil then
+         global_previous[name] = variable
+      end
+   end
+
    local result = {
       ast = ast,
       env = env,
@@ -2825,6 +2838,7 @@ function check.check(ast, env, filename)
       warnings = self.errs.warnings,
       type_errors = self.errs.errors,
       dependencies = self.dependencies,
+      global_previous = global_previous,
       needs_compat = self.needs_compat,
    }
 
@@ -6385,11 +6399,12 @@ local types = require("teal.types")
 
 local a_type = types.a_type
 
-
+local environment = require("teal.environment")
 
 
 
 local require_file = {}
+
 
 
 
@@ -6407,7 +6422,23 @@ require_file.all_extensions = {
    [".lua"] = true,
 }
 
-local function search_for(module_name, suffix, path, tried)
+local function read_file(filename)
+   local fd, open_err = io.open(filename, "rb")
+   if not fd then
+      return nil, open_err
+   end
+   local source, read_err = fd:read("*a")
+   fd:close()
+   return source, read_err
+end
+
+local function search_for(
+   module_name,
+   suffix,
+   path,
+   tried,
+   read_source)
+
    for entry in path:gmatch("[^;]+") do
       local slash_name = module_name:gsub("%.", "/")
 
@@ -6415,24 +6446,19 @@ local function search_for(module_name, suffix, path, tried)
       if not entry:match("%?[/\\]init%.lua$") then
          local filename = entry:gsub("?", slash_name)
          local tl_filename = filename:gsub("%.lua$", suffix)
-         local fd = io.open(tl_filename, "rb")
-         if not fd then
+         local code = read_source(tl_filename)
+         if not code then
             table.insert(tried, "no file '" .. tl_filename .. "'")
 
 
             tl_filename = filename:gsub("%.lua$", "/init" .. suffix)
-            fd = io.open(tl_filename, "rb")
-            if not fd then
+            code = read_source(tl_filename)
+            if not code then
                table.insert(tried, "no file '" .. tl_filename .. "'")
             end
          end
 
-         if fd then
-            local code = fd:read("*a")
-            if not code then
-               return nil, nil, tried
-            end
-            fd:close()
+         if code then
             return tl_filename, code, tried
          end
       end
@@ -6440,26 +6466,34 @@ local function search_for(module_name, suffix, path, tried)
    return nil, nil, tried
 end
 
-function require_file.search_module(module_name, extension_set)
+function require_file.search_module(
+   module_name,
+   extension_set,
+   read_source)
+
    local found
    local code
    local tried = {}
    local path = os.getenv("TL_PATH") or package.path
+   read_source = read_source or read_file
 
    if extension_set and extension_set[".d.tl"] then
-      found, code, tried = search_for(module_name, ".d.tl", path, tried)
+      found, code, tried =
+      search_for(module_name, ".d.tl", path, tried, read_source)
       if found then
          return found, code
       end
    end
    if (not extension_set) or extension_set[".tl"] then
-      found, code, tried = search_for(module_name, ".tl", path, tried)
+      found, code, tried =
+      search_for(module_name, ".tl", path, tried, read_source)
       if found then
          return found, code
       end
    end
    if extension_set and extension_set[".lua"] then
-      found, code, tried = search_for(module_name, ".lua", path, tried)
+      found, code, tried =
+      search_for(module_name, ".lua", path, tried, read_source)
       if found then
          return found, code
       end
@@ -6472,12 +6506,24 @@ local function a_circular_require(w)
 end
 
 function require_file.search_and_load(env, module_name, extension_set)
-   local found, code, tried = require_file.search_module(module_name, extension_set)
+   local function read_source(filename)
+      return environment.read_source(env, filename)
+   end
+   local found, code, tried =
+   require_file.search_module(module_name, extension_set, read_source)
    if not found then
       return nil, nil, tried
    end
 
-   env.module_filenames[module_name] = found
+   local cached = env.session and
+   env.session:restore_checked(found, module_name, code)
+   if cached then
+      return cached, found
+   end
+
+   env.module_filenames[module_name] = env.session and
+   env.session:normalize_filename(found) or
+   found
 
    local w = { f = found, x = 1, y = 1 }
    env.modules[module_name] = a_circular_require(w)
@@ -6487,9 +6533,28 @@ function require_file.search_and_load(env, module_name, extension_set)
       return nil, nil, tried
    end
 
-   env.modules[module_name] = found_result.type
+   if env.session then
+      env.session:bind_module(found, module_name, found_result)
+   else
+      env.modules[module_name] = found_result.type
+   end
 
    return found_result, found
+end
+
+function require_file.resolve_module(
+   env,
+   module_name)
+
+   local function read_source(filename)
+      return environment.read_source(env, filename)
+   end
+   local filename, source = require_file.search_module(
+   module_name,
+   require_file.all_extensions,
+   read_source)
+
+   return filename, source
 end
 
 function require_file.require_module(env, module_name)
@@ -10102,7 +10167,7 @@ end
 
 -- module teal.environment from teal/environment.lua
 package.preload["teal.environment"] = function(...)
-local _tl_compat; if (tonumber((_VERSION or ''):match('[%d.]*$')) or 0) < 5.3 then local p, m = pcall(require, 'compat53.module'); if p then _tl_compat = m end end; local pairs = _tl_compat and _tl_compat.pairs or pairs; local string = _tl_compat and _tl_compat.string or string; local table = _tl_compat and _tl_compat.table or table
+local _tl_compat; if (tonumber((_VERSION or ''):match('[%d.]*$')) or 0) < 5.3 then local p, m = pcall(require, 'compat53.module'); if p then _tl_compat = m end end; local io = _tl_compat and _tl_compat.io or io; local pairs = _tl_compat and _tl_compat.pairs or pairs; local string = _tl_compat and _tl_compat.string or string; local table = _tl_compat and _tl_compat.table or table
 local VERSION = "0.25.0-alpha+dev"
 
 local tldebug = require("teal.debug")
@@ -10134,7 +10199,14 @@ local a_type = types.a_type
 
 
 
+
+
+
 local environment = { EnvOptions = {}, Env = {}, Result = {} }
+
+
+
+
 
 
 
@@ -10201,9 +10273,14 @@ environment.DEFAULT_GEN_TARGET = "5.3"
 
 
 local require_module
+local resolve_module
 
 function environment.set_require_module_fn(fn)
    require_module = fn
+end
+
+function environment.set_resolve_module_fn(fn)
+   resolve_module = fn
 end
 
 local function empty_environment()
@@ -10215,7 +10292,25 @@ local function empty_environment()
       globals = {},
       opts = {},
       require_module = require_module,
+      resolve_module = resolve_module,
    }
+end
+
+local function read_file(filename)
+   local fd, open_err = io.open(filename, "rb")
+   if not fd then
+      return nil, open_err
+   end
+   local source, read_err = fd:read("*a")
+   fd:close()
+   return source, read_err
+end
+
+function environment.read_source(env, filename)
+   if env.session then
+      return env.session:read_source(filename)
+   end
+   return read_file(filename)
 end
 
 local function declare_globals(env)
@@ -10391,9 +10486,15 @@ function environment.load_module(env, name)
 end
 
 function environment.register(env, filename, result)
+   if env.session then
+      filename = env.session:normalize_filename(filename)
+   end
    env.loaded[filename] = result
 
    table.insert(env.loaded_order, filename)
+   if env.session then
+      env.session:record_result(filename, result.dependencies)
+   end
 end
 
 function environment.register_failed(env, filename, syntax_errors)
@@ -10403,10 +10504,10 @@ function environment.register_failed(env, filename, syntax_errors)
       type_errors = {},
       syntax_errors = syntax_errors,
       dependencies = {},
+      global_previous = {},
       env = env,
    }
-   env.loaded[filename] = result
-   table.insert(env.loaded_order, filename)
+   environment.register(env, filename, result)
    return result
 end
 
@@ -12213,12 +12314,752 @@ return targets
 
 end
 
+-- module teal.incremental from teal/incremental.lua
+package.preload["teal.incremental"] = function(...)
+local _tl_compat; if (tonumber((_VERSION or ''):match('[%d.]*$')) or 0) < 5.3 then local p, m = pcall(require, 'compat53.module'); if p then _tl_compat = m end end; local io = _tl_compat and _tl_compat.io or io; local ipairs = _tl_compat and _tl_compat.ipairs or ipairs; local math = _tl_compat and _tl_compat.math or math; local package = _tl_compat and _tl_compat.package or package; local pairs = _tl_compat and _tl_compat.pairs or pairs; local pcall = _tl_compat and _tl_compat.pcall or pcall; local string = _tl_compat and _tl_compat.string or string; local table = _tl_compat and _tl_compat.table or table; local type = type; local environment = require("teal.environment")
+
+
+
+
+
+
+
+
+
+local contract = require("teal.internal.incremental_contract")
+local types = require("teal.types")
+
+local incremental = {}
+
+
+
+
+
+
+
+
+
+
+
+
+local Session = contract.Session
+local Session_mt = {
+   __index = Session,
+}
+
+local PATH_SEPARATOR = package.config:sub(1, 1)
+
+local function normalize_filename(filename)
+   local drive = ""
+   if PATH_SEPARATOR == "\\" then
+      filename = filename:gsub("\\", "/")
+      drive, filename = filename:match("^(.:)(.*)$")
+      drive = drive or ""
+   end
+   local absolute = filename:sub(1, 1) == "/"
+   local pieces = {}
+   for piece in filename:gmatch("[^/]+") do
+      if piece == ".." then
+         local previous = pieces[#pieces]
+         if previous and previous ~= ".." then
+            table.remove(pieces)
+         elseif not absolute then
+            table.insert(pieces, piece)
+         end
+      elseif piece ~= "." then
+         table.insert(pieces, piece)
+      end
+   end
+   filename = drive ..
+   (absolute and "/" or "") ..
+   table.concat(pieces, "/")
+   if PATH_SEPARATOR == "\\" then
+      filename = filename:gsub("/", "\\")
+   end
+   return filename
+end
+
+local function read_file(filename)
+   local fd, open_err = io.open(filename, "rb")
+   if not fd then
+      return nil, open_err
+   end
+   local source, read_err = fd:read("*a")
+   fd:close()
+   return source, read_err
+end
+
+local function module_names_for(
+   env,
+   filename)
+
+   local names = {}
+   for module_name, module_filename in pairs(
+      env.module_filenames) do
+
+      if module_filename == filename then
+         table.insert(names, module_name)
+      end
+   end
+   table.sort(names)
+   return names
+end
+
+function Session:set_artifact_store(store)
+   self.store = store
+end
+
+function Session:set_source_provider(provider)
+   self.source_provider = provider
+end
+
+function Session:normalize_filename(filename)
+   return normalize_filename(filename)
+end
+
+function Session:read_source(filename)
+   local requested_filename = filename
+   filename = normalize_filename(filename)
+   local override = self.source_overrides[filename]
+   if override ~= nil then
+      return override
+   end
+   if self.source_provider then
+      local ok, source, err = pcall(
+      self.source_provider.read,
+      self.source_provider,
+      requested_filename)
+
+      if ok then
+         if source then
+            return source, err
+         end
+         return read_file(filename)
+      end
+      return nil, tostring(source)
+   end
+   return read_file(filename)
+end
+
+function Session:parse(
+   filename,
+   source,
+   flavor,
+   parse_source)
+
+   filename = normalize_filename(filename)
+   self.source_inputs[filename] = source
+   local store = self.store
+   if store then
+      local ok, ast, syntax_errors, required_modules = pcall(
+      store.get_parse,
+      store,
+      filename,
+      source,
+      flavor)
+
+      if ok and ast then
+         return ast,
+         syntax_errors or {},
+         required_modules or {},
+         true
+      end
+   end
+
+   local ast, syntax_errors, required_modules = parse_source()
+   if store and #syntax_errors == 0 then
+      pcall(
+      store.put_parse,
+      store,
+      filename,
+      source,
+      flavor,
+      ast,
+      syntax_errors,
+      required_modules)
+
+   end
+   return ast, syntax_errors, required_modules, false
+end
+
+function Session:remember_root(
+   filename,
+   module_name)
+
+   filename = normalize_filename(filename)
+   local key = filename .. "\0" .. (module_name or "\1")
+   if not self.roots[key] then
+      table.insert(self.root_order, key)
+   end
+   self.roots[key] = {
+      filename = filename,
+      module_name = module_name,
+   }
+end
+
+local function forget_roots(session, filename)
+   for i = #session.root_order, 1, -1 do
+      local key = session.root_order[i]
+      if session.roots[key].filename == filename then
+         session.roots[key] = nil
+         table.remove(session.root_order, i)
+      end
+   end
+end
+
+function Session:bind_module(
+   filename,
+   module_name,
+   result)
+
+   local env = self.env
+   local checked = result
+   filename = normalize_filename(filename)
+   env.module_filenames[module_name] = filename
+   env.modules[module_name] = checked.type
+   if module_name:match("%.init$") then
+      local base = module_name:sub(1, -6)
+      env.modules[base] = checked.type
+      env.module_filenames[base] = filename
+   end
+end
+
+function Session:record_result(
+   filename,
+   result_dependencies)
+
+   filename = normalize_filename(filename)
+   local previous = self.dependencies[filename] or {}
+   for _, dependency in pairs(previous) do
+      local dependents = self.reverse_dependencies[dependency]
+      if dependents then
+         dependents[filename] = nil
+      end
+   end
+
+   local dependencies = {}
+   for module_name, dependency in pairs(
+      result_dependencies or {}) do
+
+      dependency = normalize_filename(dependency)
+      result_dependencies[module_name] = dependency
+      dependencies[module_name] = dependency
+      local dependents = self.reverse_dependencies[dependency]
+      if not dependents then
+         dependents = {}
+         self.reverse_dependencies[dependency] = dependents
+      end
+      dependents[filename] = true
+   end
+   self.dependencies[filename] = dependencies
+
+   if self.store then
+      pcall(
+      self.store.record_result,
+      self.store,
+      filename,
+      dependencies)
+
+   end
+end
+
+function Session:restore_checked(
+   filename,
+   module_name,
+   source)
+
+   local env = self.env
+   local store = self.store
+   filename = normalize_filename(filename)
+   self.source_inputs[filename] = source
+   if not store or env.report_types then
+      return nil
+   end
+   for _, result in pairs(env.loaded) do
+      if not self.restored_results[result] then
+         return nil
+      end
+   end
+
+   local function resolve(name)
+      local found, resolved_source = env.resolve_module(env, name)
+      return found and normalize_filename(found), resolved_source
+   end
+
+   local ok, plan = pcall(
+   store.load_checked,
+   store,
+   filename,
+   module_name,
+   source,
+   resolve)
+
+   if not ok or type(plan) ~= "table" or #plan == 0 then
+      return nil
+   end
+
+   local root
+   local namespace
+   local max_typeid, max_typevar = types.internal_get_state()
+   for _, item in ipairs(plan) do
+      if type(item) ~= "table" then
+         return nil
+      end
+      local cached = item
+      local result = cached.result
+      if type(cached.filename) ~= "string" or
+         type(cached.module_name) ~= "string" or
+         type(cached.typeid_namespace) ~= "string" or
+         type(cached.typeid_ctr) ~= "number" or
+         type(cached.typevar_ctr) ~= "number" or
+         type(result) ~= "table" or
+         normalize_filename(result.filename) ~= cached.filename or
+         type(result.ast) ~= "table" or
+         type(result.type) ~= "table" or
+         type(result.dependencies) ~= "table" or
+         next(result.global_previous or {}) ~= nil then
+
+         return nil
+      end
+      if (namespace and namespace ~= cached.typeid_namespace) or
+         (self.restored_namespace and
+         self.restored_namespace ~= cached.typeid_namespace) then
+
+         return nil
+      end
+      namespace = cached.typeid_namespace
+      max_typeid = math.max(max_typeid, cached.typeid_ctr)
+      max_typevar = math.max(max_typevar, cached.typevar_ctr)
+      if cached.filename == filename and
+         cached.module_name == module_name then
+
+         root = result
+      end
+   end
+   if not root then
+      return nil
+   end
+
+   types.internal_force_state(max_typeid, max_typevar)
+   for _, item in ipairs(plan) do
+      local cached = item
+      local result = cached.result
+      local existing = env.loaded[cached.filename]
+      if existing then
+         if not self.restored_results[existing] then
+            return nil
+         end
+         result = existing
+      else
+         result.env = env
+         environment.register(
+         env,
+         cached.filename,
+         result)
+
+         self.restored_results[result] = true
+      end
+      self:bind_module(
+      cached.filename,
+      cached.module_name,
+      result)
+
+      if cached.filename == filename and
+         cached.module_name == module_name then
+
+         root = result
+      end
+   end
+   self.restored_namespace = namespace
+   return root
+end
+
+function Session:affected(filename)
+   filename = normalize_filename(filename)
+   local affected = {}
+   local queued = { [filename] = true }
+   local queue = { filename }
+   local env = self.env
+   for dependent, dependencies in pairs(self.dependencies) do
+      for module_name, expected in pairs(dependencies) do
+         local found = env.resolve_module(env, module_name)
+         if (found and normalize_filename(found) or nil) ~= expected then
+            if not queued[expected] then
+               queued[expected] = true
+               table.insert(queue, expected)
+            end
+            if not queued[dependent] then
+               queued[dependent] = true
+               table.insert(queue, dependent)
+            end
+         end
+      end
+   end
+   local scan = 1
+   while scan <= #queue do
+      local current = queue[scan]
+      table.insert(affected, current)
+      for dependent in pairs(
+         self.reverse_dependencies[current] or {}) do
+
+         if not queued[dependent] then
+            queued[dependent] = true
+            table.insert(queue, dependent)
+         end
+      end
+      scan = scan + 1
+   end
+   table.sort(affected)
+   return affected
+end
+
+function Session:update(
+   filename,
+   source)
+
+   filename = normalize_filename(filename)
+   self.source_inputs[filename] = source
+   local env = self.env
+   local known = env.loaded[filename] ~= nil or
+   self.dependencies[filename] ~= nil or
+   self.reverse_dependencies[filename] ~= nil
+   self.source_overrides[filename] = source
+   local change = self:invalidate(filename)
+   if not known then
+      table.insert(change.roots, {
+         filename = filename,
+      })
+   end
+   return change
+end
+
+function Session:invalidate(
+   filename)
+
+   filename = normalize_filename(filename)
+   local env = self.env
+   local affected = self:affected(filename)
+   local aliases = {}
+   for module_name, module_filename in pairs(
+      env.module_filenames) do
+
+      local names = aliases[module_filename]
+      if not names then
+         names = {}
+         aliases[module_filename] = names
+      end
+      table.insert(names, module_name)
+   end
+
+   local remembered_roots = {}
+   for _, key in ipairs(self.root_order) do
+      local root = self.roots[key]
+      table.insert(remembered_roots, {
+         filename = root.filename,
+         module_name = root.module_name,
+      })
+   end
+
+   local invalidated_set = {}
+   for _, current in ipairs(affected) do
+      invalidated_set[current] = true
+   end
+   for current in pairs(invalidated_set) do
+      local result = env.loaded[current]
+      if result and next(result.global_previous or {}) then
+         for _, loaded in ipairs(env.loaded_order) do
+            invalidated_set[loaded] = true
+         end
+         break
+      end
+   end
+
+   local invalidated = {}
+   local report_filenames = {}
+   local reset_reporter = false
+   for i = #env.loaded_order, 1, -1 do
+      local current = env.loaded_order[i]
+      if invalidated_set[current] then
+         local result = env.loaded[current]
+         if result then
+            table.insert(report_filenames, result.filename)
+            if next(result.global_previous or {}) then
+               reset_reporter = true
+            end
+            for name, previous in pairs(
+               result.global_previous or {}) do
+
+               if type(previous) == "boolean" then
+                  env.globals[name] = nil
+               else
+                  env.globals[name] = previous
+               end
+            end
+         end
+         env.loaded[current] = nil
+         self.cached_results[current] = nil
+         table.remove(env.loaded_order, i)
+         table.insert(invalidated, current)
+      end
+   end
+
+   for module_name, module_filename in pairs(
+      env.module_filenames) do
+
+      if invalidated_set[module_filename] then
+         env.module_filenames[module_name] = nil
+         env.modules[module_name] = nil
+      end
+   end
+   if env.reporter and reset_reporter then
+      env.reporter = nil
+   elseif env.reporter then
+      env.reporter:remove_files(report_filenames)
+   end
+   table.sort(invalidated)
+
+   for _, current in ipairs(invalidated) do
+      for _, dependency in pairs(
+         self.dependencies[current] or {}) do
+
+         local dependents = self.reverse_dependencies[dependency]
+         if dependents then
+            dependents[current] = nil
+            if next(dependents) == nil then
+               self.reverse_dependencies[dependency] = nil
+            end
+         end
+      end
+      self.dependencies[current] = nil
+   end
+
+   if self.store then
+      local persisted = {}
+      local present = {}
+      for _, current in ipairs(affected) do
+         present[current] = true
+         table.insert(persisted, current)
+      end
+      for _, current in ipairs(invalidated) do
+         if not present[current] then
+            table.insert(persisted, current)
+         end
+      end
+      table.sort(persisted)
+      pcall(
+      self.store.invalidate,
+      self.store,
+      filename,
+      persisted)
+
+   end
+
+   local evicted = {}
+   for _, current in ipairs(invalidated) do
+      local module_names = aliases[current] or {}
+      table.sort(module_names)
+      table.insert(evicted, {
+         filename = current,
+         module_names = module_names,
+      })
+   end
+
+   local roots = {}
+   for _, root in ipairs(remembered_roots) do
+      if invalidated_set[root.filename] then
+         table.insert(roots, root)
+      end
+   end
+
+   return {
+      changed = filename,
+      evicted = evicted,
+      roots = roots,
+   }
+end
+
+function Session:recheck(
+   change,
+   compiler)
+
+   local env = self.env
+   local batch = {
+      files = {},
+      roots = change.roots,
+   }
+   local previously_loaded = {}
+   for _, filename in ipairs(env.loaded_order) do
+      previously_loaded[filename] = true
+   end
+
+   for _, root in ipairs(change.roots) do
+      local module
+      local check_error
+      local result = env.loaded[root.filename]
+      if result then
+         if root.module_name then
+            self:bind_module(
+            root.filename,
+            root.module_name,
+            result)
+
+         end
+         module, check_error = compiler:recall(root.filename)
+      else
+         local input, open_error = compiler:open(root.filename)
+         if not input then
+            batch.files[root.filename] = {
+               filename = root.filename,
+               module_names = {},
+               open_error = open_error,
+            }
+            forget_roots(self, root.filename)
+         else
+            module, check_error = input:check(root.module_name)
+         end
+      end
+
+      if module or check_error then
+         batch.files[root.filename] = {
+            filename = root.filename,
+            module_names = {},
+            module = module,
+            errors = check_error,
+         }
+      end
+   end
+
+   local changed_result = env.loaded[change.changed]
+   if changed_result and
+      next(changed_result.global_previous or {}) and
+      next(previously_loaded) then
+
+      return self:recheck(
+      self:invalidate(change.changed),
+      compiler)
+
+   end
+
+   for _, filename in ipairs(env.loaded_order) do
+      if not previously_loaded[filename] and
+         not batch.files[filename] then
+
+         local module, check_error = compiler:recall(filename)
+         batch.files[filename] = {
+            filename = filename,
+            module_names = module_names_for(
+            env,
+            filename),
+
+            module = module,
+            errors = check_error,
+         }
+      end
+   end
+
+   for _, item in ipairs(change.evicted) do
+      local file_result = batch.files[item.filename]
+      if not file_result or not file_result.module then
+         local module, check_error =
+         compiler:recall(item.filename)
+         if module then
+            file_result = {
+               filename = item.filename,
+               module = module,
+               errors = check_error,
+               module_names = module_names_for(
+               env,
+               item.filename),
+
+            }
+            batch.files[item.filename] = file_result
+         elseif not file_result then
+            file_result = {
+               filename = item.filename,
+               module_names = item.module_names,
+            }
+            batch.files[item.filename] = file_result
+         end
+      end
+      if file_result.module then
+         file_result.module_names = module_names_for(
+         env,
+         item.filename)
+
+      else
+         file_result.module_names = item.module_names
+      end
+   end
+
+   return batch
+end
+
+function Session:cache_results()
+   local env = self.env
+   local store = self.store
+   if not store or env.report_types then
+      return
+   end
+   local typeid_ctr, typevar_ctr = types.internal_get_state()
+   for _, filename in ipairs(env.loaded_order) do
+      local result = env.loaded[filename]
+      if result and self.restored_results[result] then
+         self.cached_results[filename] = result
+      elseif result and
+         not self.cached_results[filename] and
+         not self.restored_namespace then
+
+         local source = self.source_inputs[filename] or
+         self:read_source(filename)
+         if source then
+            pcall(
+            store.put_checked,
+            store,
+            filename,
+            source,
+            result,
+            typeid_ctr,
+            typevar_ctr)
+
+         end
+         self.cached_results[filename] = result
+      end
+   end
+end
+
+function incremental.new(
+   env,
+   store)
+
+   return setmetatable({
+      env = env,
+      store = store,
+      source_overrides = {},
+      source_inputs = {},
+      dependencies = {},
+      reverse_dependencies = {},
+      roots = {},
+      root_order = {},
+      cached_results = {},
+      restored_results = {},
+   }, Session_mt)
+end
+
+return incremental
+
+end
+
 -- module teal.init from teal/init.lua
 package.preload["teal.init"] = function(...)
-local _tl_compat; if (tonumber((_VERSION or ''):match('[%d.]*$')) or 0) < 5.3 then local p, m = pcall(require, 'compat53.module'); if p then _tl_compat = m end end; local io = _tl_compat and _tl_compat.io or io; local pairs = _tl_compat and _tl_compat.pairs or pairs; local string = _tl_compat and _tl_compat.string or string; local check = require("teal.check.check")
+local _tl_compat; if (tonumber((_VERSION or ''):match('[%d.]*$')) or 0) < 5.3 then local p, m = pcall(require, 'compat53.module'); if p then _tl_compat = m end end; local pairs = _tl_compat and _tl_compat.pairs or pairs; local check = require("teal.check.check")
 local environment = require("teal.environment")
 
 local errors = require("teal.errors")
+local incremental = require("teal.incremental")
+local compiler_state =
+require("teal.internal.compiler_state")
+
+local incremental_memory = require("teal.internal.incremental_memory")
 local lexer = require("teal.lexer")
 local loader = require("teal.loader")
 local lua_compat = require("teal.gen.lua_compat")
@@ -12230,7 +13071,21 @@ local targets = require("teal.gen.targets")
 
 local util = require("teal.util")
 
-local teal = { CheckError = {}, Compiler = {}, Input = {}, TokenList = {}, ParseTree = {}, Module = {}, CompilerOptions = {} }
+local teal = { CheckError = {}, FileResult = {}, RecheckBatch = {}, Compiler = {}, Input = {}, TokenList = {}, ParseTree = {}, Module = {}, CompilerOptions = {} }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -12355,6 +13210,7 @@ local Module = teal.Module
 
 
 
+
 local Input = teal.Input
 
 
@@ -12365,29 +13221,46 @@ local TokenList = teal.TokenList
 
 
 
+
 local Compiler_mt = { __index = Compiler }
 local Input_mt = { __index = Input }
 local TokenList_mt = { __index = TokenList }
 local ParseTree_mt = { __index = ParseTree }
 local Module_mt = { __index = Module }
 
+local function attach_environment(
+   value,
+   env)
+
+   compiler_state.set(value, env)
+   return value
+end
+
+local function pipeline_environment(value)
+   return compiler_state.get(value)
+end
+
 environment.set_require_module_fn(require_file.require_module)
+environment.set_resolve_module_fn(require_file.resolve_module)
 
 
 
 
 
 local function module_from_result(result)
-   local module = setmetatable({
+   local parse_tree = attach_environment(
+   setmetatable({
       filename = result.filename,
-      parse_tree = setmetatable({
-         filename = result.filename,
-         ast = result.ast,
-         required_modules = util.sorted_keys(result.dependencies),
-         syntax_errors = result.syntax_errors,
-      }, ParseTree_mt),
-      env = result.env,
-   }, Module_mt)
+      ast = result.ast,
+      required_modules = util.sorted_keys(result.dependencies),
+      syntax_errors = result.syntax_errors,
+   }, ParseTree_mt),
+   result.env)
+
+   local module = attach_environment(setmetatable({
+      filename = result.filename,
+      parse_tree = parse_tree,
+   }, Module_mt), result.env)
 
    local check_error = {
       syntax_errors = result.syntax_errors or {},
@@ -12406,20 +13279,16 @@ function Compiler:input(teal_code, filename)
    if teal_code == nil then
       return nil, "missing Teal code as input"
    end
-   return setmetatable({
+   return attach_environment(setmetatable({
       filename = filename or "<input>.tl",
       teal_code = teal_code,
-      env = self.env,
-   }, Input_mt)
+   }, Input_mt), pipeline_environment(self))
 end
 
 function Compiler:open(filename)
-   local fd, err = io.open(filename, "rb")
-   if not fd then
-      return nil, "could not open " .. err
-   end
-
-   local teal_code, read_err = fd:read("*a")
+   local env = pipeline_environment(self)
+   local teal_code, read_err =
+   environment.read_source(env, filename)
    if not teal_code then
       return nil, "could not open " .. read_err
    end
@@ -12428,39 +13297,80 @@ function Compiler:open(filename)
 end
 
 function Compiler:require(module_name)
-   local ok, err = environment.load_module(self.env, module_name)
+   local env = pipeline_environment(self)
+   local ok, err = environment.load_module(env, module_name)
    if not ok then
       return nil, nil, err
    end
 
-   local filename = self.env.module_filenames[module_name]
-   local result = self.env.loaded[filename]
+   local filename = env.module_filenames[module_name]
+   local result = env.loaded[filename]
    return module_from_result(result)
 end
 
+function Compiler:set_source_provider(provider)
+   local env = pipeline_environment(self)
+   env.session:set_source_provider(provider)
+end
+
+function Compiler:update(
+   filename,
+   source)
+
+   local env = pipeline_environment(self)
+   return env.session:update(filename, source)
+end
+
+function Compiler:affected(filename)
+   local env = pipeline_environment(self)
+   return env.session:affected(filename)
+end
+
+function Compiler:invalidate(filename)
+   local env = pipeline_environment(self)
+   return env.session:invalidate(filename)
+end
+
+function Compiler:recheck(change)
+   return pipeline_environment(self).session:recheck(
+   change,
+   self)
+
+end
+
 function Compiler:enable_type_reporting(enable)
-   self.env.keep_going = enable
-   self.env.report_types = enable
+   local env = pipeline_environment(self)
+   env.keep_going = enable
+   env.report_types = enable
 end
 
 function Compiler:get_type_report()
-   if not self.env.reporter then
+   local env = pipeline_environment(self)
+   if not env.reporter then
       return nil
    end
 
-   return self.env.reporter:get_report()
+   return env.reporter:get_report()
 end
 
 function Compiler:loaded_files()
+   local env = pipeline_environment(self)
    local i = 0
    return function()
       i = i + 1
-      return self.env.loaded_order[i]
+      local filename = env.loaded_order[i]
+      local result = filename and env.loaded[filename]
+      return result and result.filename
    end
 end
 
 function Compiler:recall(filename)
-   local result = self.env.loaded[filename]
+   local env = pipeline_environment(self)
+   local result = env.loaded[filename]
+   if not result then
+      filename = env.session:normalize_filename(filename)
+      result = env.loaded[filename]
+   end
    if not result then
       return nil, nil
    end
@@ -12475,24 +13385,70 @@ end
 
 
 function Input:lex()
+   local env = pipeline_environment(self)
    local tokens, errs = lexer.lex(self.teal_code, self.filename)
-   return setmetatable({
+   return attach_environment(setmetatable({
       filename = self.filename,
       tokens = tokens,
       lexical_errors = errs,
-      env = self.env,
-   }, TokenList_mt), errs
+   }, TokenList_mt), env), errs
 end
 
 function Input:parse()
-   local token_list = self:lex()
-   return token_list:parse()
+   local env = pipeline_environment(self)
+   local fresh_tree
+   local fresh_error
+   local function parse_source()
+      local token_list = self:lex()
+      fresh_tree, fresh_error = token_list:parse()
+      return fresh_tree.ast,
+      fresh_tree.syntax_errors,
+      fresh_tree.required_modules
+   end
+
+   local ast, errs, required_modules, cached =
+   env.session:parse(
+   self.filename,
+   self.teal_code,
+   "program",
+   parse_source)
+
+   if not cached then
+      return fresh_tree, fresh_error
+   end
+   if #errs > 0 and not env.keep_going then
+      environment.register_failed(env, self.filename, errs)
+   end
+   return attach_environment(setmetatable({
+      filename = self.filename,
+      required_modules = required_modules,
+      ast = ast,
+      syntax_errors = errs,
+   }, ParseTree_mt), env), #errs > 0 and errs or nil
 end
 
 function Input:check(module_name)
+   local env = pipeline_environment(self)
+   env.session:remember_root(
+   self.filename,
+   module_name)
+
+   if module_name then
+      local cached = env.session:restore_checked(
+      self.filename,
+      module_name,
+      self.teal_code)
+
+      if cached then
+         return module_from_result(
+         cached)
+
+      end
+   end
+
    local parse_tree, parse_error = self:parse()
 
-   if parse_error and not self.env.keep_going then
+   if parse_error and not env.keep_going then
       return nil, {
          syntax_errors = parse_error,
          type_errors = {},
@@ -12521,20 +13477,20 @@ function TokenList:get_token_at(line, column)
 end
 
 function TokenList:parse()
+   local env = pipeline_environment(self)
    local errs = self.lexical_errors or {}
    local ast, required_modules = parser.parse_program(self.tokens, errs, self.filename)
 
-   if #errs > 0 and not self.env.keep_going then
-      environment.register_failed(self.env, self.filename, errs)
+   if #errs > 0 and not env.keep_going then
+      environment.register_failed(env, self.filename, errs)
    end
 
-   return setmetatable({
+   return attach_environment(setmetatable({
       filename = self.filename,
       required_modules = required_modules,
       ast = ast,
-      env = self.env,
       syntax_errors = errs,
-   }, ParseTree_mt), #errs > 0 and errs or nil
+   }, ParseTree_mt), env), #errs > 0 and errs or nil
 end
 
 
@@ -12542,13 +13498,20 @@ end
 
 
 function ParseTree:check(module_name)
-   if #self.syntax_errors > 0 and not self.env.keep_going then
-      local result = self.env.loaded[self.filename]
+   local env = pipeline_environment(self)
+   env.session:remember_root(
+   self.filename,
+   module_name)
+
+   if #self.syntax_errors > 0 and not env.keep_going then
+      local filename =
+      env.session:normalize_filename(self.filename)
+      local result = env.loaded[filename]
       local _, check_err = module_from_result(result)
       return nil, check_err
    end
 
-   local result = check.check(self.ast, self.env, self.filename)
+   local result = check.check(self.ast, env, self.filename)
    if result then
       result.syntax_errors = self.syntax_errors
 
@@ -12557,11 +13520,11 @@ function ParseTree:check(module_name)
       end
 
       if module_name then
-         self.env.modules[module_name] = result.type
-         if module_name:match("%.init$") then
-            module_name = module_name:sub(1, -6)
-            self.env.modules[module_name] = result.type
-         end
+         env.session:bind_module(
+         self.filename,
+         module_name,
+         result)
+
       end
    end
 
@@ -12573,7 +13536,12 @@ end
 
 
 function Module:gen(opts)
-   return lua_generator.generate(self.parse_tree.ast, self.env.opts.gen_target, opts)
+   local env = pipeline_environment(self)
+   return lua_generator.generate(
+   self.parse_tree.ast,
+   env.opts.gen_target,
+   opts)
+
 end
 
 
@@ -12590,7 +13558,13 @@ function teal.compiler(opts)
       no_stdlib = opts and not not opts.no_stdlib,
    }
 
-   compiler.env = environment.new(env_opts)
+   local env = environment.new(env_opts)
+   local store = opts and opts.incremental and
+   incremental_memory.new() or
+
+   nil
+   env.session = incremental.new(env, store)
+   compiler_state.set(compiler, env)
 
    return compiler
 end
@@ -12634,6 +13608,9 @@ local check = require("teal.check.check")
 local parser = require("teal.parser")
 
 
+
+
+
 local environment = require("teal.environment")
 
 
@@ -12642,11 +13619,30 @@ local input = {}
 
 
 function input.check(env, filename, code)
-   if env.loaded and env.loaded[filename] then
-      return env.loaded[filename]
+   local loaded_filename = filename
+   if env.session then
+      loaded_filename = env.session:normalize_filename(filename)
+   end
+   if env.loaded and env.loaded[loaded_filename] then
+      return env.loaded[loaded_filename]
    end
 
-   local program, syntax_errors = parser.parse(code, filename)
+   local program
+   local syntax_errors
+   local function parse_source()
+      local ast, errs, required = parser.parse(code, filename)
+      return ast, errs, required
+   end
+   if env.session then
+      program, syntax_errors = env.session:parse(
+      filename,
+      code,
+      "reader",
+      parse_source)
+
+   else
+      program, syntax_errors = parse_source()
+   end
 
    if (not env.keep_going) and #syntax_errors > 0 then
       return environment.register_failed(env, filename, syntax_errors)
@@ -12660,6 +13656,416 @@ function input.check(env, filename, code)
 end
 
 return input
+
+end
+
+-- module teal.internal.compiler_state from teal/internal/compiler_state.lua
+package.preload["teal.internal.compiler_state"] = function(...)
+local compiler_state = {}
+
+
+
+
+local environments = setmetatable(
+{},
+{ __mode = "k" })
+
+
+function compiler_state.set(compiler, environment)
+   environments[compiler] = environment
+end
+
+function compiler_state.get(compiler)
+   return environments[compiler]
+end
+
+return compiler_state
+
+end
+
+-- module teal.internal.incremental_contract from teal/internal/incremental_contract.lua
+package.preload["teal.internal.incremental_contract"] = function(...)
+
+
+
+
+
+
+local incremental_contract = { SourceProvider = {}, CachedResult = {}, Root = {}, Evicted = {}, ChangeSet = {}, ArtifactStore = {}, InputAdapter = {}, CompilerAdapter = {}, Session = {} }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+return incremental_contract
+
+end
+
+-- module teal.internal.incremental_memory from teal/internal/incremental_memory.lua
+package.preload["teal.internal.incremental_memory"] = function(...)
+local _tl_compat; if (tonumber((_VERSION or ''):match('[%d.]*$')) or 0) < 5.3 then local p, m = pcall(require, 'compat53.module'); if p then _tl_compat = m end end; local ipairs = _tl_compat and _tl_compat.ipairs or ipairs; local pairs = _tl_compat and _tl_compat.pairs or pairs
+
+
+local incremental_memory = { Store = {} }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local Store = incremental_memory.Store
+local Store_mt = {
+   __index = Store,
+}
+
+local function clone_graph(value, seen)
+   if type(value) ~= "table" then
+      return value
+   end
+   seen = seen or {}
+   local previous = seen[value]
+   if previous then
+      return previous
+   end
+
+   local copy = {}
+   seen[value] = copy
+   for key, item in pairs(value) do
+      copy[clone_graph(key, seen)] = clone_graph(item, seen)
+   end
+   return setmetatable(copy, getmetatable(value))
+end
+
+local function copy_array(values)
+   local copy = {}
+   for i, value in ipairs(values or {}) do
+      copy[i] = value
+   end
+   return copy
+end
+
+function Store:get_parse(
+   filename,
+   source,
+   flavor)
+
+   local by_flavor = self.objects[filename]
+   local by_source = by_flavor and by_flavor[flavor]
+   local object =
+   by_source and by_source[source]
+   if not object then
+      self.misses = self.misses + 1
+      return nil
+   end
+   self.hits = self.hits + 1
+   return clone_graph(object.ast),
+   copy_array(object.syntax_errors),
+   copy_array(object.required_modules)
+end
+
+function Store:put_parse(
+   filename,
+   source,
+   flavor,
+   ast,
+   syntax_errors,
+   required_modules)
+
+   if #syntax_errors > 0 then
+      return
+   end
+   local by_flavor = self.objects[filename]
+   if not by_flavor then
+      by_flavor = {}
+      self.objects[filename] = by_flavor
+   end
+   local by_source = by_flavor[flavor]
+   if not by_source then
+      by_source = {}
+      by_flavor[flavor] = by_source
+   end
+   if not by_source[source] then
+      self.writes = self.writes + 1
+   end
+   by_source[source] = {
+      ast = clone_graph(ast),
+      syntax_errors = copy_array(syntax_errors),
+      required_modules = copy_array(required_modules),
+   }
+end
+
+function Store:record_result(
+   _filename,
+   _dependencies)
+
+end
+
+function Store:invalidate(
+   filename,
+   _affected)
+
+   self.objects[filename] = nil
+end
+
+function Store:put_checked(
+   _filename,
+   _source,
+   _result,
+   _typeid_ctr,
+   _typevar_ctr)
+
+end
+
+function Store:load_checked(
+   _filename,
+   _module_name,
+   _source,
+   _resolve_module)
+
+
+
+   return nil
+end
+
+function Store:stats()
+   return {
+      hits = self.hits,
+      misses = self.misses,
+      writes = self.writes,
+   }
+end
+
+function incremental_memory.new()
+   return setmetatable({
+      objects = {},
+      hits = 0,
+      misses = 0,
+      writes = 0,
+   }, Store_mt)
+end
+
+return incremental_memory
 
 end
 
@@ -18155,6 +19561,7 @@ local type_reporter = { TypeCollector = { Symbol = {} }, TypeInfo = {}, TypeRepo
 
 
 
+
 local TypeReport = type_reporter.TypeReport
 local TypeReporter = type_reporter.TypeReporter
 
@@ -18199,6 +19606,7 @@ local typecodes = {
    UNKNOWN = 0x80008000,
    INVALID = 0x80000000,
 }
+type_reporter.typecodes = typecodes
 
 
 
@@ -18568,6 +19976,28 @@ end
 
 function TypeReporter:get_report()
    return self.tr
+end
+
+function TypeReporter:remove_files(filenames)
+   local removed_symbols = false
+   for _, filename in ipairs(filenames) do
+      self.tr.by_pos[filename] = nil
+      if self.tr.symbols == self.tr.symbols_by_file[filename] then
+         removed_symbols = true
+      end
+      self.tr.symbols_by_file[filename] = nil
+   end
+   if removed_symbols then
+      self.tr.symbols = nil
+      local remaining = {}
+      for filename in pairs(self.tr.symbols_by_file) do
+         table.insert(remaining, filename)
+      end
+      table.sort(remaining)
+      if remaining[1] then
+         self.tr.symbols = self.tr.symbols_by_file[remaining[1]]
+      end
+   end
 end
 
 

@@ -19,6 +19,11 @@ SOURCES = teal/debug.tl teal/attributes.tl teal/errors.tl teal/lexer.tl \
 	teal/gen/targets.tl teal/gen/lua_generator.tl teal/gen/lua_compat.tl \
 	teal/package_loader.tl teal/loader.tl \
 	teal/api/v2.tl teal/api/v1.tl \
+	teal/internal/incremental_contract.tl \
+	teal/internal/incremental_memory.tl \
+	teal/internal/compiler_state.tl \
+	teal/internal/compiler_artifacts.tl \
+	teal/incremental.tl \
 	teal/init.tl \
 	tl.tl \
 	tlcli/configuration.tl \

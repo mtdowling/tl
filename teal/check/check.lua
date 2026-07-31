@@ -1,4 +1,4 @@
-local _tl_compat; if (tonumber((_VERSION or ''):match('[%d.]*$')) or 0) < 5.3 then local p, m = pcall(require, 'compat53.module'); if p then _tl_compat = m end end; local assert = _tl_compat and _tl_compat.assert or assert; local context = require("teal.check.context")
+local _tl_compat; if (tonumber((_VERSION or ''):match('[%d.]*$')) or 0) < 5.3 then local p, m = pcall(require, 'compat53.module'); if p then _tl_compat = m end end; local assert = _tl_compat and _tl_compat.assert or assert; local pairs = _tl_compat and _tl_compat.pairs or pairs; local context = require("teal.check.context")
 local Context = context.Context
 
 local tldebug = require("teal.debug")
@@ -102,6 +102,7 @@ end
 function check.check(ast, env, filename)
    assert(filename)
 
+   local previous_globals = shallow_copy_table(env.globals)
    local self = Context.new(env, filename)
 
    local visit_node, visit_type = visit_node, visit_type
@@ -132,6 +133,18 @@ function check.check(ast, env, filename)
 
    errors.clear_redundant_errors(self.errs.errors)
 
+   local global_previous = {}
+   for name, variable in pairs(env.globals) do
+      if previous_globals[name] ~= variable then
+         global_previous[name] = previous_globals[name] or false
+      end
+   end
+   for name, variable in pairs(previous_globals) do
+      if env.globals[name] == nil then
+         global_previous[name] = variable
+      end
+   end
+
    local result = {
       ast = ast,
       env = env,
@@ -140,6 +153,7 @@ function check.check(ast, env, filename)
       warnings = self.errs.warnings,
       type_errors = self.errs.errors,
       dependencies = self.dependencies,
+      global_previous = global_previous,
       needs_compat = self.needs_compat,
    }
 

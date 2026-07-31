@@ -30,6 +30,9 @@ local type TypeReporter = type_reporter.TypeReporter
 local type variables = require("teal.variables")
 local type Variable = variables.Variable
 
+local type incremental_contract =
+   require("teal.internal.incremental_contract")
+
 local record environment
    VERSION: string
    DEFAULT_GEN_COMPAT: GenCompat
@@ -55,6 +58,7 @@ local record environment
    end
 
    type RequireModuleFn = function(env: Env, module_name: string): Type, string
+   type ResolveModuleFn = function(env: Env, module_name: string): string, string
 
    record Env
       loaded: {string:Result}
@@ -69,6 +73,8 @@ local record environment
       modules: {string:Type}
       module_filenames: {string:string}
       require_module: RequireModuleFn
+      resolve_module: ResolveModuleFn
+      session: incremental_contract.Session
    end
 
    record Result
@@ -81,6 +87,7 @@ local record environment
       warnings: {Error}
       env: Env
       dependencies: {string:string} -- module name, file found
+      global_previous: {string:(Variable|boolean)}
       needs_compat: {string:boolean}
       compat_applied: boolean
    end
@@ -97,9 +104,14 @@ local type Env = environment.Env
 local type Result = environment.Result
 
 local require_module: environment.RequireModuleFn
+local resolve_module: environment.ResolveModuleFn
 
 function environment.set_require_module_fn(fn: environment.RequireModuleFn)
    require_module = fn
+end
+
+function environment.set_resolve_module_fn(fn: environment.ResolveModuleFn)
+   resolve_module = fn
 end
 
 local function empty_environment(): Env
@@ -111,7 +123,25 @@ local function empty_environment(): Env
       globals = {},
       opts = {},
       require_module = require_module,
+      resolve_module = resolve_module,
    }
+end
+
+local function read_file(filename: string): string, string
+   local fd, open_err = io.open(filename, "rb")
+   if not fd then
+      return nil, open_err
+   end
+   local source, read_err = fd:read("*a")
+   fd:close()
+   return source, read_err
+end
+
+function environment.read_source(env: Env, filename: string): string, string
+   if env.session then
+      return env.session:read_source(filename)
+   end
+   return read_file(filename)
 end
 
 local function declare_globals(env: Env)
@@ -287,9 +317,15 @@ function environment.load_module(env: Env, name: string): boolean, string
 end
 
 function environment.register(env: Env, filename: string, result: Result)
+   if env.session then
+      filename = env.session:normalize_filename(filename)
+   end
    env.loaded[filename] = result
 
    table.insert(env.loaded_order, filename)
+   if env.session then
+      env.session:record_result(filename, result.dependencies)
+   end
 end
 
 function environment.register_failed(env: Env, filename: string, syntax_errors: {Error}): Result
@@ -299,10 +335,10 @@ function environment.register_failed(env: Env, filename: string, syntax_errors: 
       type_errors = {},
       syntax_errors = syntax_errors,
       dependencies = {},
+      global_previous = {},
       env = env,
    }
-   env.loaded[filename] = result
-   table.insert(env.loaded_order, filename)
+   environment.register(env, filename, result)
    return result
 end
 

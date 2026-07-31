@@ -1,5 +1,12 @@
 local tl = require("teal.api.v2")
 
+describe("typecodes", function()
+   it("exports the runtime type code table", function()
+      assert.same(0x00000020, tl.typecodes.FUNCTION)
+      assert.same(0x00020008, tl.typecodes.RECORD)
+   end)
+end)
+
 local function resolve_type_ref(tr, type_number)
    local type_info = tr.types[type_number]
    if type_info and type_info.ref then

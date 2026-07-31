@@ -1,4 +1,5 @@
 local util = require("spec.util")
+local lfs = require("lfs")
 
 local function popen_tl(...)
    return io.popen(util.tl_cmd(...) .. " 2>&1", "r")
@@ -106,10 +107,299 @@ local function tl_to_lua(name)
    return (name:gsub("%.tl$", ".lua"):gsub("^" .. util.os_tmp .. util.os_sep, ""))
 end
 
+local function generated_objects(path)
+   local result = {}
+   local function scan(directory)
+      local attributes = lfs.attributes(directory)
+      if not attributes or attributes.mode ~= "directory" then
+         return
+      end
+      for basename in lfs.dir(directory) do
+         if basename ~= "." and basename ~= ".." then
+            local child = directory
+               .. util.os_sep
+               .. basename
+            local child_attributes = lfs.attributes(child)
+            if child_attributes
+               and child_attributes.mode == "directory"
+            then
+               scan(child)
+            elseif basename:match("%.gen$") then
+               table.insert(result, child)
+            end
+         end
+      end
+   end
+   scan(path)
+   table.sort(result)
+   return result
+end
+
 describe("tl gen", function()
    setup(util.chdir_setup)
    teardown(util.chdir_teardown)
    describe("on .tl files", function()
+      it("reuses cached output and invalidates dependency changes", function()
+         local root = util.write_tmp_dir(finally, {
+            ["dep.tl"] = [[
+               return {
+                  answer = 42,
+               }
+            ]],
+            ["main.tl"] = [[
+               local dep = require("dep")
+               print(dep.answer)
+            ]],
+         })
+         local cache = root .. "cache"
+         local command_options = {
+            env = {
+               TL_CACHE_DIR = cache,
+            },
+         }
+
+         util.do_in(root, function()
+            local function generate()
+               local process = assert(io.popen(util.tl_cmd(
+                  "gen",
+                  command_options,
+                  "main.tl"
+               ) .. " 2>&1", "r"))
+               local output = process:read("*a")
+               util.assert_popen_close(0, process:close())
+               assert.match("Wrote: main.lua", output, 1, true)
+            end
+
+            generate()
+            local expected = util.read_file("main.lua")
+            local objects = generated_objects(cache)
+            assert.same(1, #objects)
+
+            assert(os.remove("main.lua"))
+            generate()
+            assert.same(expected, util.read_file("main.lua"))
+            assert.same(1, #generated_objects(cache))
+
+            local corrupt = assert(io.open(objects[1], "wb"))
+            assert(corrupt:write("corrupt"))
+            assert(corrupt:close())
+            assert(os.remove("main.lua"))
+            generate()
+            assert.same(expected, util.read_file("main.lua"))
+            assert.same(1, #generated_objects(cache))
+
+            local dependency = assert(io.open("dep.tl", "wb"))
+            assert(dependency:write([[
+               return {
+                  answer = 43,
+               }
+            ]]))
+            assert(dependency:close())
+            generate()
+            assert.same(2, #generated_objects(cache))
+
+            local no_check_cache = root .. "no-check-cache"
+            local process = assert(io.popen(util.tl_cmd(
+               "gen",
+               {
+                  env = {
+                     TL_CACHE_DIR = no_check_cache,
+                  },
+               },
+               "--no-check",
+               "main.tl"
+            ) .. " 2>&1", "r"))
+            process:read("*a")
+            util.assert_popen_close(0, process:close())
+            assert.same(
+               0,
+               #generated_objects(no_check_cache)
+            )
+
+            local warning = assert(io.open("warning.tl", "wb"))
+            assert(warning:write("local unused = 10"))
+            assert(warning:close())
+            local warning_cache = root .. "warning-cache"
+            process = assert(io.popen(util.tl_cmd(
+               "gen",
+               {
+                  env = {
+                     TL_CACHE_DIR = warning_cache,
+                  },
+               },
+               "warning.tl"
+            ) .. " 2>&1", "r"))
+            local warning_output = process:read("*a")
+            util.assert_popen_close(0, process:close())
+            assert.match("1 warning", warning_output, 1, true)
+            assert.same(
+               1,
+               #generated_objects(warning_cache)
+            )
+
+            assert(os.remove("warning.lua"))
+            process = assert(io.popen(util.tl_cmd(
+               "gen",
+               {
+                  env = {
+                     TL_CACHE_DIR = warning_cache,
+                  },
+               },
+               "warning.tl"
+            ) .. " 2>&1", "r"))
+            warning_output = process:read("*a")
+            util.assert_popen_close(0, process:close())
+            assert.match("1 warning", warning_output, 1, true)
+            assert.same(
+               1,
+               #generated_objects(warning_cache)
+            )
+
+            local warning_options_cache =
+               root .. "warning-options-cache"
+            process = assert(io.popen(util.tl_cmd(
+               "gen",
+               {
+                  env = {
+                     TL_CACHE_DIR =
+                        warning_options_cache,
+                  },
+               },
+               "warning.tl",
+               "--wdisable",
+               "unused"
+            ) .. " 2>&1", "r"))
+            warning_output = process:read("*a")
+            util.assert_popen_close(0, process:close())
+            assert.not_match(
+               "1 warning",
+               warning_output,
+               1,
+               true
+            )
+
+            assert(os.remove("warning.lua"))
+            process = assert(io.popen(util.tl_cmd(
+               "gen",
+               {
+                  env = {
+                     TL_CACHE_DIR =
+                        warning_options_cache,
+                  },
+               },
+               "warning.tl"
+            ) .. " 2>&1", "r"))
+            warning_output = process:read("*a")
+            util.assert_popen_close(0, process:close())
+            assert.match(
+               "1 warning",
+               warning_output,
+               1,
+               true
+            )
+         end)
+      end)
+
+      it("keeps generated objects outside a changed closure", function()
+         local root = util.write_tmp_dir(finally, {
+            ["dep.tl"] = "return 1",
+            ["main.tl"] = [[
+               local dep = require("dep")
+               print(dep)
+            ]],
+            ["other.tl"] = "print('unchanged')",
+         })
+         local cache = root .. "cache"
+         local command_options = {
+            env = {
+               TL_CACHE_DIR = cache,
+            },
+         }
+
+         util.do_in(root, function()
+            local function generate()
+               local process = assert(io.popen(util.tl_cmd(
+                  "gen",
+                  command_options,
+                  "main.tl",
+                  "other.tl"
+               ) .. " 2>&1", "r"))
+               process:read("*a")
+               util.assert_popen_close(0, process:close())
+            end
+
+            generate()
+            local main_output = util.read_file("main.lua")
+            local other_output = util.read_file("other.lua")
+            assert.same(2, #generated_objects(cache))
+
+            local dependency = assert(io.open("dep.tl", "wb"))
+            assert(dependency:write("return 2"))
+            assert(dependency:close())
+            generate()
+
+            assert.same(main_output, util.read_file("main.lua"))
+            assert.same(other_output, util.read_file("other.lua"))
+            assert.same(3, #generated_objects(cache))
+
+            assert(os.remove("main.lua"))
+            assert(os.remove("other.lua"))
+            generate()
+            assert.same(main_output, util.read_file("main.lua"))
+            assert.same(other_output, util.read_file("other.lua"))
+            assert.same(3, #generated_objects(cache))
+         end)
+      end)
+
+      it("rebuilds when a changed file introduces globals", function()
+         local root = util.write_tmp_dir(finally, {
+            ["before.tl"] = "return 1",
+            ["changed.tl"] = "local value = 1",
+            ["after.tl"] = "return 2",
+         })
+         local cache = root .. "cache"
+         local command_options = {
+            env = {
+               TL_CACHE_DIR = cache,
+            },
+         }
+
+         util.do_in(root, function()
+            local function generate()
+               local process = assert(io.popen(util.tl_cmd(
+                  "gen",
+                  command_options,
+                  "before.tl",
+                  "changed.tl",
+                  "after.tl"
+               ) .. " 2>&1", "r"))
+               process:read("*a")
+               util.assert_popen_close(
+                  0,
+                  process:close()
+               )
+            end
+
+            generate()
+            assert.same(3, #generated_objects(cache))
+
+            local changed =
+               assert(io.open("changed.tl", "wb"))
+            assert(changed:write(
+               "global introduced: number = 1"
+            ))
+            assert(changed:close())
+            generate()
+            assert.same(6, #generated_objects(cache))
+
+            assert(os.remove("before.lua"))
+            assert(os.remove("changed.lua"))
+            assert(os.remove("after.lua"))
+            generate()
+            assert.same(6, #generated_objects(cache))
+         end)
+      end)
+
       it("works on empty files", function()
          local name = util.write_tmp_file(finally, [[]])
          local pd = popen_tl("gen", name)

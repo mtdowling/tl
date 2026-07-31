@@ -183,6 +183,7 @@ end
 
 local vars_prefix = { util.os_set("LUA_PATH", util.os_path(package.path)) .. util.os_join }
 table.insert(vars_prefix, util.os_set("LUA_CPATH", util.os_path(package.cpath)) .. util.os_join)
+table.insert(vars_prefix, util.os_set("TL_CACHE_DIR", "off") .. util.os_join)
 for i = 1, 4 do
    table.insert(vars_prefix, util.os_set("LUA_PATH_5_" .. tostring(i), util.os_path(package.path)) .. util.os_join)
    table.insert(vars_prefix, util.os_set("LUA_CPATH_5_" .. tostring(i), util.os_path(package.cpath)) .. util.os_join)
@@ -197,6 +198,30 @@ util.lua_interpreter = arg[first_arg]
 vars_prefix = table.concat(vars_prefix)
 local lua_prefix = util.lua_interpreter .. " " .. tl_executable
 local cmd_prefix = vars_prefix .. " " .. lua_prefix
+
+local function command_prefix(options)
+   local environment = options
+      and options.env
+   if not environment then
+      return cmd_prefix
+   end
+   local names = {}
+   for name in pairs(environment) do
+      table.insert(names, name)
+   end
+   table.sort(names)
+   local assignments = {}
+   for _, name in ipairs(names) do
+      table.insert(
+         assignments,
+         util.os_set(name, environment[name]) .. util.os_join
+      )
+   end
+   return vars_prefix
+      .. table.concat(assignments)
+      .. " "
+      .. lua_prefix
+end
 
 function util.tl_pipe_cmd(piped, name, ...)
    assert(name, "no command provided")
@@ -243,7 +268,7 @@ function util.tl_cmd(name, ...)
       has_pre_commands = true
    end
    local cmd = {
-      cmd_prefix,
+      command_prefix(pre_command_args),
       table.concat(pre_command_args, " "),
       name
    }

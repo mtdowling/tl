@@ -3,6 +3,7 @@ STABLE_TL ?= $(LUA) ./tl
 NEW_TL ?= $(LUA) ./tl
 TLGENFLAGS = --check --gen-target=5.1
 BUSTED = busted --suppress-pending
+export TL_CACHE_DIR = off
 
 PRECOMPILED = teal/precompiled/default_env.lua
 SOURCES = teal/debug.tl teal/attributes.tl teal/errors.tl teal/lexer.tl \
@@ -28,6 +29,11 @@ SOURCES = teal/debug.tl teal/attributes.tl teal/errors.tl teal/lexer.tl \
 	tl.tl \
 	tlcli/configuration.tl \
 	tlcli/report.tl \
+	tlcli/cache_format.tl \
+	tlcli/project_cache/storage.tl \
+	tlcli/project_cache/generated.tl \
+	tlcli/project_cache/snapshot.tl \
+	tlcli/project_cache.tl \
 	tlcli/driver.tl \
 	tlcli/perf.tl \
 	tlcli/main.tl \

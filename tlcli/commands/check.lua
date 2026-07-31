@@ -12,7 +12,8 @@ local report = require("tlcli.report")
 
 return function(tlconfig, args)
    perf.turbo(true)
-   local compiler = driver.setup_compiler(tlconfig)
+   local compiler = driver.setup_compiler(tlconfig, "check")
+   driver.prepare_compiler(compiler, args["file"])
    for i, input_file in ipairs(args["file"]) do
       local _, _, err = driver.process_module(compiler, input_file)
       if err then
@@ -22,6 +23,7 @@ return function(tlconfig, args)
       perf.check_collect(i)
    end
 
+   driver.finish_compiler(compiler)
    local ok = report.report_all_errors(tlconfig, compiler)
 
    if ok and tlconfig["quiet"] == false and #args["file"] == 1 then
